@@ -1,79 +1,128 @@
-CREATE OR REPLACE TABLE main.shared.fiscal_calendar_445 AS
-WITH params AS (
-  SELECT
-    to_date('2024-02-04') AS start_date,   -- First day of FY1
-    10 AS num_years
-),
-leap_years AS (
-  SELECT explode(array(3, 8)) AS fiscal_year
-),
-fy AS (
-  SELECT
-    fy.fiscal_year,
-    p.start_date,
-    date_add(
-      p.start_date,
-      (
-        SELECT COALESCE(SUM(fy_days), 0)
-        FROM (
-          SELECT
-            y AS prior_fy,
-            CASE 
-              WHEN exists(SELECT 1 FROM leap_years ly WHERE ly.fiscal_year = y)
-              THEN 371 ELSE 364 
-            END AS fy_days
-          FROM (
-            SELECT explode(sequence(1, fy.fiscal_year - 1)) AS y
-          )
-        )
-      )
-    ) AS fy_start_date,
-    CASE 
-      WHEN exists(SELECT 1 FROM leap_years ly WHERE ly.fiscal_year = fy.fiscal_year)
-      THEN 371 ELSE 364 
-    END AS fy_days
-  FROM params p
-  CROSS JOIN (SELECT explode(sequence(1, (SELECT num_years FROM params))) AS fiscal_year) fy
-),
-days AS (
-  SELECT
-    fiscal_year,
-    explode(sequence(fy_start_date, date_add(fy_start_date, fy_days - 1), interval 1 day)) AS calendar_date,
-    fy_start_date
-  FROM fy
-),
-d AS (
-  SELECT
-    fiscal_year,
-    calendar_date,
-    fy_start_date,
-    datediff(calendar_date, fy_start_date) + 1 AS fiscal_day_of_year,
-    cast(floor((datediff(calendar_date, fy_start_date)) / 7) + 1 as int) AS fiscal_week_of_year,
-    cast(((floor(datediff(calendar_date, fy_start_date)/7)) % 13) + 1 as int) AS fiscal_week_of_quarter,
-    cast(floor((floor(datediff(calendar_date, fy_start_date)/7)) / 13) + 1 as int) AS fiscal_quarter
-  FROM days
-),
-periods AS (
-  SELECT
-    *,
-    CASE
-      WHEN fiscal_week_of_quarter BETWEEN 1 AND 4 THEN 1
-      WHEN fiscal_week_of_quarter BETWEEN 5 AND 8 THEN 2
-      ELSE 3
-    END AS fiscal_period_in_quarter
-  FROM d
+from datetime import date, timedelta
+from typing import Dict, List, Tuple
+
+import pandas as pd
+
+# -----------------------
+# PARAMETERS
+# -----------------------
+START_DATE = date(2000, 1, 1)   # Exact FY1 Day 1
+NUM_YEARS  = 100
+SHIFT_DAYS = 0                  # Manual shift (positive or negative)
+# TARGET_TABLE = "main.shared.fiscal_calendar_445"
+
+
+# -------------------------------------------------
+# Compute FY starts using rolling 364-day logic
+# with manual global shift
+# -------------------------------------------------
+def compute_fy_starts_and_leaps(
+    start_date: date,
+    num_years: int,
+    shift_days: int
+) -> Tuple[Dict[int, date], List[int]]:
+
+    adjusted_start = start_date + timedelta(days=shift_days)
+
+    fy_starts: Dict[int, date] = {}
+    leap_years_algo: List[int] = []
+
+    current_start = adjusted_start
+
+    for fy in range(1, num_years + 1):
+        fy_starts[fy] = current_start
+
+        # Calculate next FY start assuming 364 days
+        next_start = current_start + timedelta(days=364)
+
+        # Drift check against actual solar year
+        # If calendar difference >= 371, force leap week
+        solar_next = date(current_start.year + 1, current_start.month, current_start.day)
+        drift = (solar_next - next_start).days
+
+        if drift >= 7:
+            next_start += timedelta(days=7)
+            leap_years_algo.append(fy)
+
+        current_start = next_start
+
+    return fy_starts, leap_years_algo
+
+
+# -------------------------------------------------
+# Build daily 4-4-5 calendar
+# -------------------------------------------------
+def build_calendar(
+    fy_starts: Dict[int, date],
+    leap_years: List[int],
+    num_years: int
+) -> pd.DataFrame:
+
+    leap_set = set(leap_years)
+    rows = []
+
+    for fy in range(1, num_years + 1):
+        fy_start = fy_starts[fy]
+        fy_days = 371 if fy in leap_set else 364
+        fy_end = fy_start + timedelta(days=fy_days - 1)
+
+        d = fy_start
+        while d <= fy_end:
+            day_of_year = (d - fy_start).days + 1
+            week_of_year = ((day_of_year - 1) // 7) + 1
+            quarter = ((week_of_year - 1) // 13) + 1
+            week_of_quarter = ((week_of_year - 1) % 13) + 1
+
+            if 1 <= week_of_quarter <= 4:
+                period_in_quarter = 1
+            elif 5 <= week_of_quarter <= 8:
+                period_in_quarter = 2
+            else:
+                period_in_quarter = 3
+
+            period = (quarter - 1) * 3 + period_in_quarter
+
+            rows.append({
+                "calendar_date": pd.Timestamp(d),
+                "fiscal_year": fy,
+                "fiscal_quarter": quarter,
+                "fiscal_period": period,
+                "fiscal_week_of_year": week_of_year,
+                "fiscal_week_of_quarter": week_of_quarter,
+                "fiscal_day_of_year": day_of_year,
+                "is_53_week_year": (fy in leap_set),
+                "fiscal_year_label": f"FY{fy:02d}",
+                "fiscal_quarter_label": f"FY{fy:02d}-Q{quarter}",
+                "fiscal_month_label": f"FY{fy:02d}-M{period:01d}"
+            })
+
+            d += timedelta(days=1)
+
+    return pd.DataFrame(rows).sort_values("calendar_date")
+
+
+# -----------------------
+# RUN
+# -----------------------
+fy_starts, leap_years_algo = compute_fy_starts_and_leaps(
+    START_DATE,
+    NUM_YEARS,
+    SHIFT_DAYS
 )
-SELECT
-  calendar_date,
-  fiscal_year,
-  fiscal_quarter,
-  (fiscal_quarter - 1) * 3 + fiscal_period_in_quarter AS fiscal_period,
-  fiscal_week_of_year,
-  fiscal_week_of_quarter,
-  fiscal_day_of_year,
-  concat('FY', lpad(cast(fiscal_year as string), 2, '0')) AS fiscal_year_label,
-  concat('FY', lpad(cast(fiscal_year as string), 2, '0'),
-         '-Q', cast(fiscal_quarter as string)) AS fiscal_quarter_label,
-  concat('P', lpad(cast(((fiscal_quarter - 1) * 3 + fiscal_period_in_quarter) as string), 2, '0')) AS fiscal_period_label
-FROM periods
-ORDER BY calendar_date;
+
+print("Manual SHIFT_DAYS =", SHIFT_DAYS)
+print("Leap Fiscal Years (FY numbers):")
+print(leap_years_algo)
+
+pdf = build_calendar(fy_starts, leap_years_algo, NUM_YEARS)
+sdf = spark.createDataFrame(pdf)
+
+# (
+#     sdf.write
+#       .format("delta")
+#       .mode("overwrite")
+#       .option("overwriteSchema", "true")
+#       .saveAsTable(TARGET_TABLE)
+# )
+
+display(sdf.limit(1000))
