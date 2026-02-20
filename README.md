@@ -54,7 +54,7 @@ Identify which fiscal years contain a 53rd week
 Typically occurs every 5–6 years
 Document these rules before proceeding.
 
-Step 2 — Execute Fiscal Calendar Creation Script
+Step 2 — Execute Fiscal Calendar Creation Script (fiscal_calendar_445 file)
 
 6. Validation Checklist
 After execution, validate:
